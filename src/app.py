@@ -1,23 +1,50 @@
 """
 High School Management System API
 
-A super simple FastAPI application that allows students to view and sign up
-for extracurricular activities at Mergington High School.
+A super simple FastAPI application that allows teachers to manage student
+registrations for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+import json
+import os
+import secrets
+from pathlib import Path
+from typing import Optional
+
+from fastapi import Cookie, FastAPI, HTTPException, Response, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
-from pathlib import Path
+from pydantic import BaseModel
 
 app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+              description="API for viewing activities and managing registrations")
+
+SESSION_COOKIE_NAME = "teacher_session"
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+def load_teacher_credentials() -> dict[str, str]:
+    teachers_file = current_dir / "teachers.json"
+    with teachers_file.open("r", encoding="utf-8") as file:
+        teachers = json.load(file)
+
+    return {
+        teacher["username"]: teacher["password"]
+        for teacher in teachers["teachers"]
+    }
+
+
+teacher_credentials = load_teacher_credentials()
+active_sessions: dict[str, str] = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 # In-memory activity database
 activities = {
@@ -78,6 +105,16 @@ activities = {
 }
 
 
+def require_teacher_session(session_token: Optional[str]) -> str:
+    if not session_token or session_token not in active_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Teacher login required"
+        )
+
+    return active_sessions[session_token]
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/static/index.html")
@@ -88,9 +125,56 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/session")
+def get_session(teacher_session: Optional[str] = Cookie(default=None)):
+    username = active_sessions.get(teacher_session) if teacher_session else None
+    return {
+        "authenticated": username is not None,
+        "username": username
+    }
+
+
+@app.post("/auth/login")
+def login(request: LoginRequest, response: Response):
+    expected_password = teacher_credentials.get(request.username)
+    if expected_password != request.password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password"
+        )
+
+    session_token = secrets.token_urlsafe(32)
+    active_sessions[session_token] = request.username
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        samesite="lax"
+    )
+    return {
+        "message": f"Logged in as {request.username}",
+        "username": request.username
+    }
+
+
+@app.post("/auth/logout")
+def logout(response: Response, teacher_session: Optional[str] = Cookie(default=None)):
+    if teacher_session:
+        active_sessions.pop(teacher_session, None)
+
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    teacher_session: Optional[str] = Cookie(default=None)
+):
     """Sign up a student for an activity"""
+    require_teacher_session(teacher_session)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +195,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    teacher_session: Optional[str] = Cookie(default=None)
+):
     """Unregister a student from an activity"""
+    require_teacher_session(teacher_session)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
